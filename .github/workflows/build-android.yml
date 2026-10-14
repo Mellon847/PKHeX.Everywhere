@@ -20,16 +20,100 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
       - name: Set up NuGet
         uses: NuGet/setup-nuget@v2
 
-      - name: Restore dependencies
+      - name: Locate project and solution files
+        id: locate
         shell: pwsh
         run: |
-          nuget restore PKHeX.Mobile.sln
+          Write-Host "Searching for solution and project files..."
+
+          $root = $env:GITHUB_WORKSPACE
+
+          Write-Host ""
+          Write-Host "Repository root:"
+          Write-Host $root
+
+          Write-Host ""
+          Write-Host "Solution files:"
+
+          $solutions = @(
+            Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -in @(".sln", ".slnx")
+            }
+          )
+
+          foreach ($solution in $solutions) {
+            Write-Host $solution.FullName
+          }
+
+          Write-Host ""
+          Write-Host "Android project files:"
+
+          $projects = @(
+            Get-ChildItem -Path $root -Recurse -Filter "PKHeX.Android.csproj" -File -ErrorAction SilentlyContinue
+          )
+
+          foreach ($project in $projects) {
+            Write-Host $project.FullName
+          }
+
+          if ($projects.Count -eq 0) {
+            throw "PKHeX.Android.csproj was not found in the repository."
+          }
+
+          $project = $projects[0].FullName
+
+          "project=$project" >> $env:GITHUB_OUTPUT
+
+          if ($solutions.Count -gt 0) {
+            $solution = $solutions[0].FullName
+            "solution=$solution" >> $env:GITHUB_OUTPUT
+            Write-Host ""
+            Write-Host "Selected solution: $solution"
+          }
+          else {
+            Write-Host ""
+            Write-Host "No solution file found. The project will be restored directly."
+          }
+
+          Write-Host ""
+          Write-Host "Selected Android project: $project"
+
+      - name: Restore dependencies
+        shell: pwsh
+        env:
+          SOLUTION: ${{ steps.locate.outputs.solution }}
+          PROJECT: ${{ steps.locate.outputs.project }}
+        run: |
+          if ($env:SOLUTION) {
+            Write-Host "Restoring solution:"
+            Write-Host $env:SOLUTION
+
+            if ([System.IO.Path]::GetExtension($env:SOLUTION) -eq ".slnx") {
+              dotnet restore $env:SOLUTION
+            }
+            else {
+              nuget restore $env:SOLUTION
+            }
+          }
+          else {
+            Write-Host "No solution file found."
+            Write-Host "Restoring Android project directly:"
+            Write-Host $env:PROJECT
+
+            dotnet restore $env:PROJECT
+          }
 
           if ($LASTEXITCODE -ne 0) {
-            throw "NuGet dependency restoration failed."
+            throw "Dependency restoration failed. Check the output above."
           }
 
       - name: Install Android SDK Platform 30
@@ -52,6 +136,9 @@ jobs:
             throw "Android SDK Manager (sdkmanager.bat) was not found."
           }
 
+          Write-Host "Android SDK Manager: $manager"
+          Write-Host "Installing Android SDK Platform 30..."
+
           & $manager "--sdk_root=$sdk" "platforms;android-30"
 
           if ($LASTEXITCODE -ne 0) {
@@ -62,17 +149,22 @@ jobs:
             throw "Android SDK Platform 30 was not installed correctly."
           }
 
+          "ANDROID_HOME=$sdk" >> $env:GITHUB_ENV
+          "ANDROID_SDK_ROOT=$sdk" >> $env:GITHUB_ENV
+
       - name: Build Android application
         shell: pwsh
+        env:
+          PROJECT: ${{ steps.locate.outputs.project }}
         run: |
-          $project = Get-ChildItem `
-            -Recurse `
-            -Filter "PKHeX.Android.csproj" |
-            Select-Object -First 1 -ExpandProperty FullName
+          $project = $env:PROJECT
 
-          if (-not $project) {
-            throw "PKHeX.Android.csproj was not found."
+          if (-not $project -or -not (Test-Path $project)) {
+            throw "The Android project file could not be found: $project"
           }
+
+          Write-Host "Building project:"
+          Write-Host $project
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 
@@ -92,8 +184,10 @@ jobs:
           $msbuildExe = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
 
           if (-not (Test-Path $msbuildExe)) {
-            throw "MSBuild.exe was not found."
+            throw "MSBuild.exe was not found at: $msbuildExe"
           }
+
+          Write-Host "MSBuild: $msbuildExe"
 
           & $msbuildExe $project `
             /t:PackageForAndroid `
@@ -109,21 +203,45 @@ jobs:
         id: apk
         shell: pwsh
         run: |
-          $apk = Get-ChildItem `
-            -Recurse `
-            -Filter "*.apk" |
+          $root = $env:GITHUB_WORKSPACE
+
+          $apks = @(
+            Get-ChildItem `
+              -Path $root `
+              -Recurse `
+              -Filter "*.apk" `
+              -File `
+              -ErrorAction SilentlyContinue |
             Where-Object {
               $_.FullName -match '[\\/]bin[\\/]Release[\\/]'
-            } |
-            Select-Object -First 1
+            }
+          )
 
-          if (-not $apk) {
+          if ($apks.Count -eq 0) {
+            Write-Host "No APK found in a Release output directory."
+
+            Write-Host ""
+            Write-Host "Searching for Android package outputs..."
+
+            Get-ChildItem `
+              -Path $root `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -in @(".apk", ".aab")
+            } |
+            Select-Object -ExpandProperty FullName
+
             throw "No APK was generated. Check the build output."
           }
 
-          "path=$($apk.FullName)" >> $env:GITHUB_OUTPUT
+          $apk = $apks[0]
 
-          Write-Host "APK found: $($apk.FullName)"
+          Write-Host "APK found:"
+          Write-Host $apk.FullName
+
+          "path=$($apk.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
